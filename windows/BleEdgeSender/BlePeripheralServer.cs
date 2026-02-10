@@ -76,8 +76,8 @@ internal sealed class BlePeripheralServer
             using var writer = new DataWriter();
             writer.WriteBytes(payload);
 
-            var status = await characteristic.NotifyValueAsync(writer.DetachBuffer());
-            return status == GattCommunicationStatus.Success;
+            var results = await characteristic.NotifyValueAsync(writer.DetachBuffer());
+            return results.All(r => r.Status == GattCommunicationStatus.Success);
         }
         finally
         {

@@ -175,13 +175,26 @@ final class BleReceiver: NSObject {
 }
 
 extension BleReceiver: CBCentralManagerDelegate {
+    private func stateName(_ state: CBManagerState) -> String {
+        switch state {
+        case .unknown: return "unknown"
+        case .resetting: return "resetting"
+        case .unsupported: return "unsupported"
+        case .unauthorized: return "unauthorized"
+        case .poweredOff: return "poweredOff"
+        case .poweredOn: return "poweredOn"
+        @unknown default: return "other"
+        }
+    }
+
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        print("Central state: \(stateName(central.state))")
         switch central.state {
         case .poweredOn:
             print("Bluetooth ON, scanning for sender...")
-            central.scanForPeripherals(withServices: [serviceUUID], options: nil)
+            central.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
         default:
-            print("Bluetooth state: \(central.state.rawValue)")
+            break
         }
     }
 
@@ -194,9 +207,19 @@ extension BleReceiver: CBCentralManagerDelegate {
             return
         }
 
+        let name = peripheral.name ?? "unknown"
+        let advertisedServiceUUIDs = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID]) ?? []
+        let advertisedServiceText = advertisedServiceUUIDs.map(\.uuidString).joined(separator: ",")
+        print("Discovered peripheral: name=\(name) id=\(peripheral.identifier.uuidString) rssi=\(RSSI) services=[\(advertisedServiceText)]")
+
+        let hasTargetService = advertisedServiceUUIDs.contains(serviceUUID)
+        if !hasTargetService {
+            return
+        }
+
         self.peripheral = peripheral
         peripheral.delegate = self
-        print("Found sender: \(peripheral.name ?? "unknown"), connecting...")
+        print("Found sender with target service: \(name), connecting...")
         central.stopScan()
         central.connect(peripheral, options: nil)
     }
@@ -206,11 +229,18 @@ extension BleReceiver: CBCentralManagerDelegate {
         peripheral.discoverServices([serviceUUID])
     }
 
-    func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
-        print("Disconnected from sender, rescanning...")
+    func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
+        print("Failed to connect: \(error?.localizedDescription ?? "unknown error"), rescanning...")
         self.peripheral = nil
         self.inputCharacteristic = nil
-        central.scanForPeripherals(withServices: [serviceUUID], options: nil)
+        central.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
+    }
+
+    func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+        print("Disconnected from sender (\(error?.localizedDescription ?? "no error")), rescanning...")
+        self.peripheral = nil
+        self.inputCharacteristic = nil
+        central.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
     }
 }
 
@@ -221,7 +251,11 @@ extension BleReceiver: CBPeripheralDelegate {
             return
         }
 
-        guard let services = peripheral.services else { return }
+        guard let services = peripheral.services else {
+            print("No services found on peripheral")
+            return
+        }
+        print("Discovered \(services.count) service(s)")
         for service in services where service.uuid == serviceUUID {
             peripheral.discoverCharacteristics([inputCharUUID], for: service)
         }
@@ -236,12 +270,27 @@ extension BleReceiver: CBPeripheralDelegate {
             return
         }
 
-        guard let characteristics = service.characteristics else { return }
+        guard let characteristics = service.characteristics else {
+            print("No characteristics found for service \(service.uuid.uuidString)")
+            return
+        }
+        print("Discovered \(characteristics.count) characteristic(s) for service \(service.uuid.uuidString)")
         for characteristic in characteristics where characteristic.uuid == inputCharUUID {
             inputCharacteristic = characteristic
             peripheral.setNotifyValue(true, for: characteristic)
             print("Subscribed to input characteristic")
         }
+    }
+
+    func peripheral(_ peripheral: CBPeripheral,
+                    didUpdateNotificationStateFor characteristic: CBCharacteristic,
+                    error: Error?)
+    {
+        if let error {
+            print("Notification state update failed: \(error.localizedDescription)")
+            return
+        }
+        print("Notification state for \(characteristic.uuid.uuidString): \(characteristic.isNotifying)")
     }
 
     func peripheral(_ peripheral: CBPeripheral,
@@ -266,5 +315,6 @@ _ = AXIsProcessTrustedWithOptions(options)
 
 print("BleEdgeReceiver starting...")
 print("Grant Accessibility access when prompted (System Settings > Privacy & Security > Accessibility).")
-_ = BleReceiver()
+let receiver = BleReceiver()
+_ = receiver
 RunLoop.main.run()
