@@ -90,7 +90,7 @@ internal sealed class SenderApp : IAsyncDisposable
                 _lastX = ev.X;
                 _lastY = ev.Y;
                 _hasLastPoint = true;
-                return true;
+                return false;
             }
 
             var rawDx = ev.X - _lastX;
@@ -113,7 +113,9 @@ internal sealed class SenderApp : IAsyncDisposable
             _outbound.Writer.TryWrite(InputProtocol.MouseMove(dx, dy));
         }
 
-        return true;
+        // Do not suppress local pointer movement; suppressing can pin coordinates at the edge
+        // and collapse deltas to zero on some systems.
+        return false;
     }
 
     private bool OnMouseButton(MouseButtonEvent ev)

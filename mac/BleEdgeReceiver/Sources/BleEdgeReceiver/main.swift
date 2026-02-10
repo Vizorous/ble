@@ -129,6 +129,7 @@ final class BleReceiver: NSObject {
     private var peripheral: CBPeripheral?
     private var inputCharacteristic: CBCharacteristic?
     private let injector = EventInjector()
+    private var packetCount = 0
 
     override init() {
         super.init()
@@ -139,28 +140,35 @@ final class BleReceiver: NSObject {
         guard let type = data.first.flatMap(PacketType.init(rawValue:)) else {
             return
         }
+        packetCount += 1
 
         switch type {
         case .mouseMove:
             guard data.count >= 5 else { return }
             let dx = Self.readInt16LE(data, at: 1)
             let dy = Self.readInt16LE(data, at: 3)
+            if packetCount % 200 == 0 {
+                print("rx mouseMove dx=\(dx) dy=\(dy)")
+            }
             injector.moveMouse(dx: dx, dy: dy)
 
         case .mouseButton:
             guard data.count >= 3,
                   let button = MouseButtonId(rawValue: data[1])
             else { return }
+            print("rx mouseButton button=\(button.rawValue) down=\(data[2] != 0)")
             injector.mouseButton(button, isDown: data[2] != 0)
 
         case .key:
             guard data.count >= 4 else { return }
             let usage = Self.readUInt16LE(data, at: 1)
+            print("rx key usage=0x\(String(usage, radix: 16)) down=\(data[3] != 0)")
             injector.key(usage: usage, isDown: data[3] != 0)
 
         case .wheel:
             guard data.count >= 3 else { return }
             let delta = Self.readInt16LE(data, at: 1)
+            print("rx wheel delta=\(delta)")
             injector.wheel(delta: delta)
         }
     }
