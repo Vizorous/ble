@@ -1,4 +1,6 @@
 using System.Threading.Channels;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
 
 namespace BleEdgeSender;
 
@@ -21,6 +23,11 @@ internal sealed class SenderApp : IAsyncDisposable
     private int _lastX;
     private int _lastY;
     private bool _hasLastPoint;
+    private int _anchorX;
+    private int _anchorY;
+    private int _pendingDx;
+    private int _pendingDy;
+    private long _lastMouseFlushTimestamp;
 
     private volatile bool _remoteMode;
 
@@ -62,6 +69,11 @@ internal sealed class SenderApp : IAsyncDisposable
 
     private bool OnMouseMove(MouseMoveEvent ev)
     {
+        if (ev.IsInjected)
+        {
+            return _remoteMode;
+        }
+
         if (!_remoteMode)
         {
             if (ev.X <= LeftEdgeThresholdPx && _bleServer.HasSubscriber)
@@ -69,11 +81,17 @@ internal sealed class SenderApp : IAsyncDisposable
                 lock (_stateLock)
                 {
                     _remoteMode = true;
-                    _lastX = ev.X;
-                    _lastY = ev.Y;
+                    _anchorX = Math.Max(2, ProgramNative.GetSystemMetrics(0) / 2);
+                    _anchorY = ev.Y;
+                    _lastX = _anchorX;
+                    _lastY = _anchorY;
                     _hasLastPoint = true;
+                    _pendingDx = 0;
+                    _pendingDy = 0;
+                    _lastMouseFlushTimestamp = Stopwatch.GetTimestamp();
                 }
 
+                ProgramNative.SetCursorPos(_anchorX, _anchorY);
                 Console.WriteLine("Remote mode ON");
             }
 
@@ -93,11 +111,11 @@ internal sealed class SenderApp : IAsyncDisposable
                 return false;
             }
 
-            var rawDx = ev.X - _lastX;
-            var rawDy = ev.Y - _lastY;
+            var rawDx = ev.X - _anchorX;
+            var rawDy = ev.Y - _anchorY;
 
-            _lastX = ev.X;
-            _lastY = ev.Y;
+            _lastX = _anchorX;
+            _lastY = _anchorY;
 
             if (rawDx > short.MaxValue) rawDx = short.MaxValue;
             if (rawDx < short.MinValue) rawDx = short.MinValue;
@@ -110,12 +128,11 @@ internal sealed class SenderApp : IAsyncDisposable
 
         if (dx != 0 || dy != 0)
         {
-            _outbound.Writer.TryWrite(InputProtocol.MouseMove(dx, dy));
+            QueueMouseDelta(dx, dy);
         }
 
-        // Do not suppress local pointer movement; suppressing can pin coordinates at the edge
-        // and collapse deltas to zero on some systems.
-        return false;
+        ProgramNative.SetCursorPos(_anchorX, _anchorY);
+        return true;
     }
 
     private bool OnMouseButton(MouseButtonEvent ev)
@@ -125,6 +142,7 @@ internal sealed class SenderApp : IAsyncDisposable
             return false;
         }
 
+        FlushMouseDelta(force: true);
         _outbound.Writer.TryWrite(InputProtocol.MouseButton(ev.Button, ev.IsDown));
         return true;
     }
@@ -136,6 +154,7 @@ internal sealed class SenderApp : IAsyncDisposable
             return false;
         }
 
+        FlushMouseDelta(force: true);
         _outbound.Writer.TryWrite(InputProtocol.Wheel(delta));
         return true;
     }
@@ -153,6 +172,7 @@ internal sealed class SenderApp : IAsyncDisposable
             return false;
         }
 
+        FlushMouseDelta(force: true);
         if (HidUsageMap.TryMapVkToUsage(ev.VirtualKey, out var usage))
         {
             _outbound.Writer.TryWrite(InputProtocol.Key(usage, ev.IsDown));
@@ -191,9 +211,57 @@ internal sealed class SenderApp : IAsyncDisposable
         {
             _remoteMode = false;
             _hasLastPoint = false;
+            _pendingDx = 0;
+            _pendingDy = 0;
         }
 
         Console.WriteLine(reason);
+    }
+
+    private void QueueMouseDelta(short dx, short dy)
+    {
+        var shouldFlush = false;
+        lock (_stateLock)
+        {
+            _pendingDx += dx;
+            _pendingDy += dy;
+
+            var elapsedMs = (Stopwatch.GetTimestamp() - _lastMouseFlushTimestamp) * 1000.0 / Stopwatch.Frequency;
+            shouldFlush = elapsedMs >= 4.0 || Math.Abs(_pendingDx) >= 20 || Math.Abs(_pendingDy) >= 20;
+        }
+
+        if (shouldFlush)
+        {
+            FlushMouseDelta(force: false);
+        }
+    }
+
+    private void FlushMouseDelta(bool force)
+    {
+        int dx;
+        int dy;
+        lock (_stateLock)
+        {
+            if (!force && _pendingDx == 0 && _pendingDy == 0)
+            {
+                return;
+            }
+
+            dx = _pendingDx;
+            dy = _pendingDy;
+            _pendingDx = 0;
+            _pendingDy = 0;
+            _lastMouseFlushTimestamp = Stopwatch.GetTimestamp();
+        }
+
+        if (dx == 0 && dy == 0)
+        {
+            return;
+        }
+
+        dx = Math.Clamp(dx, short.MinValue, short.MaxValue);
+        dy = Math.Clamp(dy, short.MinValue, short.MaxValue);
+        _outbound.Writer.TryWrite(InputProtocol.MouseMove((short)dx, (short)dy));
     }
 
     public async ValueTask DisposeAsync()
@@ -215,6 +283,15 @@ internal sealed class SenderApp : IAsyncDisposable
 
         await _bleServer.StopAsync();
     }
+}
+
+internal static partial class ProgramNative
+{
+    [DllImport("user32.dll")]
+    internal static extern bool SetCursorPos(int x, int y);
+
+    [DllImport("user32.dll")]
+    internal static extern int GetSystemMetrics(int nIndex);
 }
 
 internal static class Program

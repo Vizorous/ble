@@ -3,7 +3,7 @@ using System.Runtime.InteropServices;
 
 namespace BleEdgeSender;
 
-internal readonly record struct MouseMoveEvent(int X, int Y);
+internal readonly record struct MouseMoveEvent(int X, int Y, bool IsInjected);
 internal readonly record struct MouseButtonEvent(MouseButtonId Button, bool IsDown);
 internal readonly record struct KeyEvent(int VirtualKey, bool IsDown);
 
@@ -20,6 +20,7 @@ internal sealed class InputCapture : IDisposable
     private const int WmMButtonDown = 0x0207;
     private const int WmMButtonUp = 0x0208;
     private const int WmMouseWheel = 0x020A;
+    private const uint LlmhfInjected = 0x00000001;
 
     private const int WmKeyDown = 0x0100;
     private const int WmKeyUp = 0x0101;
@@ -173,7 +174,7 @@ internal sealed class InputCapture : IDisposable
             switch (message)
             {
                 case WmMouseMove:
-                    if (_onMouseMove(new MouseMoveEvent(data.pt.x, data.pt.y)))
+                    if (_onMouseMove(new MouseMoveEvent(data.pt.x, data.pt.y, (data.flags & LlmhfInjected) != 0)))
                     {
                         return (IntPtr)1;
                     }
