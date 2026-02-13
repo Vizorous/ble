@@ -1,6 +1,7 @@
 using System.Threading.Channels;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Buffers.Binary;
 
 namespace BleEdgeSender;
 
@@ -72,7 +73,7 @@ internal sealed class SenderApp : IAsyncDisposable
     {
         if (ev.IsInjected)
         {
-            return _remoteMode;
+            return false;
         }
 
         if (!_remoteMode)
@@ -121,7 +122,7 @@ internal sealed class SenderApp : IAsyncDisposable
             // Ignore obvious coordinate spikes from warp/reposition jitter.
             if (Math.Abs(rawDx) > 1200 || Math.Abs(rawDy) > 1200)
             {
-                return true;
+                return false;
             }
 
             if (rawDx > short.MaxValue) rawDx = short.MaxValue;
@@ -138,8 +139,7 @@ internal sealed class SenderApp : IAsyncDisposable
             QueueMouseDelta(dx, dy);
         }
 
-        MaybeRecenter();
-        return true;
+        return false;
     }
 
     private bool OnMouseButton(MouseButtonEvent ev)
@@ -190,8 +190,39 @@ internal sealed class SenderApp : IAsyncDisposable
 
     private async Task SendLoopAsync(CancellationToken cancellationToken)
     {
-        await foreach (var packet in _outbound.Reader.ReadAllAsync(cancellationToken))
+        while (await _outbound.Reader.WaitToReadAsync(cancellationToken))
         {
+            if (!_outbound.Reader.TryRead(out var packet))
+            {
+                continue;
+            }
+
+            // Prevent latency buildup: coalesce queued mouse move packets into one.
+            if (packet.Length >= 5 && packet[0] == (byte)PacketType.MouseMove)
+            {
+                int sumDx = BinaryPrimitives.ReadInt16LittleEndian(packet.AsSpan(1, 2));
+                int sumDy = BinaryPrimitives.ReadInt16LittleEndian(packet.AsSpan(3, 2));
+
+                while (_outbound.Reader.TryPeek(out var next) &&
+                       next.Length >= 5 &&
+                       next[0] == (byte)PacketType.MouseMove)
+                {
+                    _outbound.Reader.TryRead(out var movePacket);
+                    if (movePacket == null)
+                    {
+                        break;
+                    }
+
+                    sumDx += BinaryPrimitives.ReadInt16LittleEndian(movePacket.AsSpan(1, 2));
+                    sumDy += BinaryPrimitives.ReadInt16LittleEndian(movePacket.AsSpan(3, 2));
+                }
+
+                packet = InputProtocol.MouseMove(
+                    (short)Math.Clamp(sumDx, short.MinValue, short.MaxValue),
+                    (short)Math.Clamp(sumDy, short.MinValue, short.MaxValue)
+                );
+            }
+
             try
             {
                 await _bleServer.SendPacketAsync(packet, cancellationToken);
