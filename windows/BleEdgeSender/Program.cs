@@ -1,5 +1,4 @@
 using System.Threading.Channels;
-using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Buffers.Binary;
 
@@ -28,9 +27,6 @@ internal sealed class SenderApp : IAsyncDisposable
     private int _anchorY;
     private int _pendingDx;
     private int _pendingDy;
-    private long _lastMouseFlushTimestamp;
-    private bool _needsRecenter;
-
     private volatile bool _remoteMode;
 
     public async Task RunAsync(CancellationToken cancellationToken)
@@ -90,8 +86,6 @@ internal sealed class SenderApp : IAsyncDisposable
                     _hasLastPoint = true;
                     _pendingDx = 0;
                     _pendingDy = 0;
-                    _lastMouseFlushTimestamp = Stopwatch.GetTimestamp();
-                    _needsRecenter = true;
                 }
 
                 Console.WriteLine("Remote mode ON");
@@ -190,51 +184,54 @@ internal sealed class SenderApp : IAsyncDisposable
 
     private async Task SendLoopAsync(CancellationToken cancellationToken)
     {
-        while (await _outbound.Reader.WaitToReadAsync(cancellationToken))
+        while (!cancellationToken.IsCancellationRequested)
         {
-            if (!_outbound.Reader.TryRead(out var packet))
-            {
-                continue;
-            }
+            // Fixed tick flush prevents mouse queue buildup.
+            FlushMouseDelta(force: false);
 
-            // Prevent latency buildup: coalesce queued mouse move packets into one.
-            if (packet.Length >= 5 && packet[0] == (byte)PacketType.MouseMove)
+            while (_outbound.Reader.TryRead(out var packet))
             {
-                int sumDx = BinaryPrimitives.ReadInt16LittleEndian(packet.AsSpan(1, 2));
-                int sumDy = BinaryPrimitives.ReadInt16LittleEndian(packet.AsSpan(3, 2));
-
-                while (_outbound.Reader.TryPeek(out var next) &&
-                       next.Length >= 5 &&
-                       next[0] == (byte)PacketType.MouseMove)
+                // Prevent latency buildup: coalesce queued mouse move packets into one.
+                if (packet.Length >= 5 && packet[0] == (byte)PacketType.MouseMove)
                 {
-                    _outbound.Reader.TryRead(out var movePacket);
-                    if (movePacket == null)
+                    int sumDx = BinaryPrimitives.ReadInt16LittleEndian(packet.AsSpan(1, 2));
+                    int sumDy = BinaryPrimitives.ReadInt16LittleEndian(packet.AsSpan(3, 2));
+
+                    while (_outbound.Reader.TryPeek(out var next) &&
+                           next.Length >= 5 &&
+                           next[0] == (byte)PacketType.MouseMove)
                     {
-                        break;
+                        _outbound.Reader.TryRead(out var movePacket);
+                        if (movePacket == null)
+                        {
+                            break;
+                        }
+
+                        sumDx += BinaryPrimitives.ReadInt16LittleEndian(movePacket.AsSpan(1, 2));
+                        sumDy += BinaryPrimitives.ReadInt16LittleEndian(movePacket.AsSpan(3, 2));
                     }
 
-                    sumDx += BinaryPrimitives.ReadInt16LittleEndian(movePacket.AsSpan(1, 2));
-                    sumDy += BinaryPrimitives.ReadInt16LittleEndian(movePacket.AsSpan(3, 2));
+                    packet = InputProtocol.MouseMove(
+                        (short)Math.Clamp(sumDx, short.MinValue, short.MaxValue),
+                        (short)Math.Clamp(sumDy, short.MinValue, short.MaxValue)
+                    );
                 }
 
-                packet = InputProtocol.MouseMove(
-                    (short)Math.Clamp(sumDx, short.MinValue, short.MaxValue),
-                    (short)Math.Clamp(sumDy, short.MinValue, short.MaxValue)
-                );
+                try
+                {
+                    await _bleServer.SendPacketAsync(packet, cancellationToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"Send failed: {ex.Message}");
+                }
             }
 
-            try
-            {
-                await _bleServer.SendPacketAsync(packet, cancellationToken);
-            }
-            catch (OperationCanceledException)
-            {
-                return;
-            }
-            catch (Exception ex)
-            {
-                Console.Error.WriteLine($"Send failed: {ex.Message}");
-            }
+            await Task.Delay(2, cancellationToken);
         }
     }
 
@@ -251,7 +248,6 @@ internal sealed class SenderApp : IAsyncDisposable
             _hasLastPoint = false;
             _pendingDx = 0;
             _pendingDy = 0;
-            _needsRecenter = false;
         }
 
         Console.WriteLine(reason);
@@ -259,19 +255,10 @@ internal sealed class SenderApp : IAsyncDisposable
 
     private void QueueMouseDelta(short dx, short dy)
     {
-        var shouldFlush = false;
         lock (_stateLock)
         {
             _pendingDx += dx;
             _pendingDy += dy;
-
-            var elapsedMs = (Stopwatch.GetTimestamp() - _lastMouseFlushTimestamp) * 1000.0 / Stopwatch.Frequency;
-            shouldFlush = elapsedMs >= 4.0 || Math.Abs(_pendingDx) >= 20 || Math.Abs(_pendingDy) >= 20;
-        }
-
-        if (shouldFlush)
-        {
-            FlushMouseDelta(force: false);
         }
     }
 
@@ -290,7 +277,6 @@ internal sealed class SenderApp : IAsyncDisposable
             dy = _pendingDy;
             _pendingDx = 0;
             _pendingDy = 0;
-            _lastMouseFlushTimestamp = Stopwatch.GetTimestamp();
         }
 
         if (dx == 0 && dy == 0)
@@ -301,42 +287,6 @@ internal sealed class SenderApp : IAsyncDisposable
         dx = Math.Clamp(dx, short.MinValue, short.MaxValue);
         dy = Math.Clamp(dy, short.MinValue, short.MaxValue);
         _outbound.Writer.TryWrite(InputProtocol.MouseMove((short)dx, (short)dy));
-    }
-
-    private void MaybeRecenter()
-    {
-        int currentX;
-        int currentY;
-        bool shouldWarp = false;
-
-        lock (_stateLock)
-        {
-            if (!_remoteMode)
-            {
-                return;
-            }
-
-            currentX = _lastX;
-            currentY = _lastY;
-            shouldWarp = _needsRecenter ||
-                         Math.Abs(currentX - _anchorX) > 120 ||
-                         Math.Abs(currentY - _anchorY) > 120;
-            _needsRecenter = false;
-        }
-
-        if (!shouldWarp)
-        {
-            return;
-        }
-
-        if (ProgramNative.SetCursorPos(_anchorX, _anchorY))
-        {
-            lock (_stateLock)
-            {
-                _lastX = _anchorX;
-                _lastY = _anchorY;
-            }
-        }
     }
 
     public async ValueTask DisposeAsync()
