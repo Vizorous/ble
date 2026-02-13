@@ -28,6 +28,7 @@ internal sealed class SenderApp : IAsyncDisposable
     private int _pendingDx;
     private int _pendingDy;
     private long _lastMouseFlushTimestamp;
+    private bool _needsRecenter;
 
     private volatile bool _remoteMode;
 
@@ -89,9 +90,9 @@ internal sealed class SenderApp : IAsyncDisposable
                     _pendingDx = 0;
                     _pendingDy = 0;
                     _lastMouseFlushTimestamp = Stopwatch.GetTimestamp();
+                    _needsRecenter = true;
                 }
 
-                ProgramNative.SetCursorPos(_anchorX, _anchorY);
                 Console.WriteLine("Remote mode ON");
             }
 
@@ -111,11 +112,17 @@ internal sealed class SenderApp : IAsyncDisposable
                 return false;
             }
 
-            var rawDx = ev.X - _anchorX;
-            var rawDy = ev.Y - _anchorY;
+            var rawDx = ev.X - _lastX;
+            var rawDy = ev.Y - _lastY;
 
-            _lastX = _anchorX;
-            _lastY = _anchorY;
+            _lastX = ev.X;
+            _lastY = ev.Y;
+
+            // Ignore obvious coordinate spikes from warp/reposition jitter.
+            if (Math.Abs(rawDx) > 1200 || Math.Abs(rawDy) > 1200)
+            {
+                return true;
+            }
 
             if (rawDx > short.MaxValue) rawDx = short.MaxValue;
             if (rawDx < short.MinValue) rawDx = short.MinValue;
@@ -131,7 +138,7 @@ internal sealed class SenderApp : IAsyncDisposable
             QueueMouseDelta(dx, dy);
         }
 
-        ProgramNative.SetCursorPos(_anchorX, _anchorY);
+        MaybeRecenter();
         return true;
     }
 
@@ -213,6 +220,7 @@ internal sealed class SenderApp : IAsyncDisposable
             _hasLastPoint = false;
             _pendingDx = 0;
             _pendingDy = 0;
+            _needsRecenter = false;
         }
 
         Console.WriteLine(reason);
@@ -262,6 +270,42 @@ internal sealed class SenderApp : IAsyncDisposable
         dx = Math.Clamp(dx, short.MinValue, short.MaxValue);
         dy = Math.Clamp(dy, short.MinValue, short.MaxValue);
         _outbound.Writer.TryWrite(InputProtocol.MouseMove((short)dx, (short)dy));
+    }
+
+    private void MaybeRecenter()
+    {
+        int currentX;
+        int currentY;
+        bool shouldWarp = false;
+
+        lock (_stateLock)
+        {
+            if (!_remoteMode)
+            {
+                return;
+            }
+
+            currentX = _lastX;
+            currentY = _lastY;
+            shouldWarp = _needsRecenter ||
+                         Math.Abs(currentX - _anchorX) > 120 ||
+                         Math.Abs(currentY - _anchorY) > 120;
+            _needsRecenter = false;
+        }
+
+        if (!shouldWarp)
+        {
+            return;
+        }
+
+        if (ProgramNative.SetCursorPos(_anchorX, _anchorY))
+        {
+            lock (_stateLock)
+            {
+                _lastX = _anchorX;
+                _lastY = _anchorY;
+            }
+        }
     }
 
     public async ValueTask DisposeAsync()

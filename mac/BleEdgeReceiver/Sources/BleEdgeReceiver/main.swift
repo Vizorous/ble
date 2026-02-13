@@ -130,7 +130,6 @@ final class BleReceiver: NSObject {
     private var inputCharacteristic: CBCharacteristic?
     private let injector = EventInjector()
     private var packetCount = 0
-    private var triedPeripherals: Set<UUID> = []
 
     override init() {
         super.init()
@@ -201,7 +200,7 @@ extension BleReceiver: CBCentralManagerDelegate {
         switch central.state {
         case .poweredOn:
             print("Bluetooth ON, scanning for sender...")
-            central.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
+            central.scanForPeripherals(withServices: [serviceUUID], options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
         default:
             break
         }
@@ -216,26 +215,13 @@ extension BleReceiver: CBCentralManagerDelegate {
             return
         }
 
-        if triedPeripherals.contains(peripheral.identifier) {
-            return
-        }
-
         let name = peripheral.name ?? "unknown"
         let advertisedServiceUUIDs = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID]) ?? []
         let advertisedServiceText = advertisedServiceUUIDs.map(\.uuidString).joined(separator: ",")
         print("Discovered peripheral: name=\(name) id=\(peripheral.identifier.uuidString) rssi=\(RSSI) services=[\(advertisedServiceText)]")
-
-        let hasTargetService = advertisedServiceUUIDs.contains(serviceUUID)
-        // Some devices do not include full service UUIDs in advertisement payload.
-        // If service UUID is present, prioritize it; otherwise try reasonably close devices.
-        if !hasTargetService && RSSI.intValue < -70 {
-            return
-        }
-
-        triedPeripherals.insert(peripheral.identifier)
         self.peripheral = peripheral
         peripheral.delegate = self
-        print("Connecting candidate peripheral: \(name)")
+        print("Connecting sender: \(name)")
         central.stopScan()
         central.connect(peripheral, options: nil)
     }
@@ -249,14 +235,14 @@ extension BleReceiver: CBCentralManagerDelegate {
         print("Failed to connect: \(error?.localizedDescription ?? "unknown error"), rescanning...")
         self.peripheral = nil
         self.inputCharacteristic = nil
-        central.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
+        central.scanForPeripherals(withServices: [serviceUUID], options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
     }
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         print("Disconnected from sender (\(error?.localizedDescription ?? "no error")), rescanning...")
         self.peripheral = nil
         self.inputCharacteristic = nil
-        central.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
+        central.scanForPeripherals(withServices: [serviceUUID], options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
     }
 }
 
@@ -272,15 +258,6 @@ extension BleReceiver: CBPeripheralDelegate {
             return
         }
         print("Discovered \(services.count) service(s)")
-        let hasTargetService = services.contains { $0.uuid == serviceUUID }
-        if !hasTargetService {
-            print("Candidate does not expose target service, disconnecting...")
-            self.peripheral = nil
-            self.inputCharacteristic = nil
-            self.central.cancelPeripheralConnection(peripheral)
-            self.central.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
-            return
-        }
 
         for service in services where service.uuid == serviceUUID {
             peripheral.discoverCharacteristics([inputCharUUID], for: service)
